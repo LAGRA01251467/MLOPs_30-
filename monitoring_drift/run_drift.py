@@ -6,6 +6,7 @@ import pandas as pd
 import yaml
 import mlflow
 from typing import Dict
+from datetime import datetime
 
 from metrics import regression_metrics, compare_metrics
 from plot_utils import ensure_dir, plot_feature_hist_pair, plot_error_bars
@@ -33,13 +34,17 @@ def simulate_drift(X: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
         if col in Xd.columns:
             Xd[col] = 0.0
 
-    # gaussian noise proportional a std
+    # gaussian noise
     std_fraction = (cfg.get("noise") or {}).get("std_fraction", 0.0)
     if std_fraction > 0:
         numeric_cols = Xd.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             std = Xd[col].std()
-            noise = np.random.normal(loc=0.0, scale=std_fraction * (std if std > 0 else 1.0), size=len(Xd))
+            noise = np.random.normal(
+                loc=0.0,
+                scale=std_fraction * (std if std > 0 else 1.0),
+                size=len(Xd)
+            )
             Xd[col] = Xd[col].astype(float) + noise
 
     # sample fraction
@@ -71,7 +76,7 @@ def main(config_path: str):
     # 3) cargar modelo desde MLflow
     model = get_model(cfg["mlflow"])
 
-    # 4) predecir y métricas
+    # 4) predicciones y métricas
     y_pred_base = model.predict(X_base)
     y_pred_drift = model.predict(X_drift)
 
@@ -85,7 +90,7 @@ def main(config_path: str):
     drift_m = regression_metrics(y_base_aligned, y_pred_drift)
     deltas = compare_metrics(base_m, drift_m)
 
-    # 5) umbrales / alertas
+    # 5) alertas
     th = cfg["thresholds"]
     alerts = {
         "mae_delta_alert": deltas["delta_mae"] > th["mae_delta_abs"],
@@ -93,9 +98,23 @@ def main(config_path: str):
         "r2_drop_alert": deltas["drop_r2"] > th["r2_drop_abs"]
     }
     any_alert = any(alerts.values())
+    #   PROPUESTA — SNAPSHOT AUDITABLE DEL ESTADO DEL DRIFT 
+    snapshot = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "mean_shifts_applied": cfg["drift"].get("mean_shifts", {}),
+        "zero_out_features": cfg["drift"].get("zero_out_features", []),
+        "noise_std_fraction": cfg["drift"].get("noise", {}).get("std_fraction", 0),
+        "sample_fraction": cfg["drift"].get("sample_fraction", 1.0),
+        "thresholds": cfg["thresholds"],
+        "alerts": alerts,
+        "any_alert": any_alert
+    }
 
-    # 6) guardar artefactos locales
-    # datos drift (inputs y predicciones)
+    snapshot_path = os.path.join(outdir, "drift_snapshot.json")
+    with open(snapshot_path, "w") as f:
+        json.dump(snapshot, f, indent=4)
+
+    # 6) artefactos locales
     X_drift_out = X_drift.copy()
     X_drift_out["y_true"] = y_base_aligned.values
     X_drift_out["y_pred_base"] = np.array(y_pred_base[:len(X_drift_out)])
@@ -112,20 +131,26 @@ def main(config_path: str):
         json.dump({"alerts": alerts, "any_alert": any_alert}, f, indent=2)
 
     # 7) gráficos
-    # 7.1 distribuciones de features alterados
-    feat_altered = list((cfg["drift"].get("mean_shifts") or {}).keys()) + list((cfg["drift"].get("zero_out_features") or []))
+    feat_altered = list((cfg["drift"].get("mean_shifts") or {}).keys()) \
+                 + list((cfg["drift"].get("zero_out_features") or []))
+
     plot_feature_hist_pair(
         X_base.reset_index(drop=True),
         X_drift.reset_index(drop=True),
         features=feat_altered,
         outdir=os.path.join(outdir, "plots", "features")
     )
-    # 7.2 barras error base vs drift
-    plot_error_bars(base_m, drift_m, os.path.join(outdir, "plots", "error_comparison.png"))
+
+    plot_error_bars(
+        base_m, drift_m,
+        os.path.join(outdir, "plots", "error_comparison.png")
+    )
 
     # 8) logging en MLflow
     mlflow.set_experiment("absenteeism_drift_monitoring")
+
     with mlflow.start_run(run_name="drift_simulation"):
+
         # log params
         mlflow.log_params({
             "mean_shifts": str(cfg["drift"].get("mean_shifts")),
@@ -133,7 +158,8 @@ def main(config_path: str):
             "noise_std_fraction": cfg["drift"].get("noise", {}).get("std_fraction", 0),
             "sample_fraction": cfg["drift"].get("sample_fraction", 1.0),
         })
-        # log metrics base y drift
+
+        # log metrics
         mlflow.log_metrics({
             "base_mae": base_m["mae"],
             "base_rmse": base_m["rmse"],
@@ -143,19 +169,24 @@ def main(config_path: str):
             "drift_r2": drift_m["r2"],
             "delta_mae": deltas["delta_mae"],
             "delta_rmse": deltas["delta_rmse"],
-            "drop_r2": deltas["drop_r2"],
+            "drop_r2": deltas["drop_r2"]
         })
-        # log alerts como tags
+
+        #   PROPUESTA — TAGS DE DRIFT EN MLFLOW
         mlflow.set_tags({
-            "mae_delta_alert": str(alerts["mae_delta_alert"]),
-            "rmse_delta_alert": str(alerts["rmse_delta_alert"]),
-            "r2_drop_alert": str(alerts["r2_drop_alert"]),
-            "any_alert": str(any_alert),
+            "drift_any_alert": str(any_alert),
+            "drift_mae_delta_alert": str(alerts["mae_delta_alert"]),
+            "drift_rmse_delta_alert": str(alerts["rmse_delta_alert"]),
+            "drift_r2_drop_alert": str(alerts["r2_drop_alert"])
         })
-        # log artifacts
+
+        # snapshot como artifact
+        mlflow.log_artifact(snapshot_path)
+
+        # log artifacts completos
         mlflow.log_artifacts(outdir)
 
-    # 9) salida por consola
+    # 9) salida consola
     print("=== BASE ===", base_m)
     print("=== DRIFT ===", drift_m)
     print("=== DELTAS ===", deltas)
@@ -166,3 +197,4 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="monitoring_drift/drift_config.yaml")
     args = parser.parse_args()
     main(args.config)
+
